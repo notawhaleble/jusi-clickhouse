@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jusi-clickhouse"
+version = "0.1.0"
+description = "ClickHouse provider plugin for Jusi SQL"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Jusi contributors" }
+]
+dependencies = [
+  "clickhouse-connect>=0.7",
+  "jusi",
+  "jusi-sql",
+  "sqlparse>=0.4",
+  "visidata>=3,<4",
+]
+
+[project.entry-points."jusi.display_handlers"]
+clickhouse = "jusi_clickhouse.plugin:display_handler_specs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jusi_clickhouse"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../jusi/src", "../jusi-sql/src"]
