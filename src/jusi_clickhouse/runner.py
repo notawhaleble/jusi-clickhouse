@@ -4,6 +4,7 @@ import json
 import curses
 from collections import deque
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -15,6 +16,7 @@ from visidata import ItemColumn, SequenceSheet, run, vd
 
 from jusi_sql import (
     MetadataCache,
+    MetadataSnapshot,
     SqlCompletionRequest,
     SqlSheetActions,
     bind_sql_actions,
@@ -36,6 +38,9 @@ CLICKHOUSE_KEYWORDS = (
     "OFFSET", "INSERT", "INTO", "CREATE", "ALTER", "DROP", "TRUNCATE", "WITH",
     "FORMAT", "SETTINGS", "VALUES", "SHOW", "DESCRIBE", "EXPLAIN",
 )
+CLICKHOUSE_RELATION_KEYWORDS = frozenset({
+    "FROM", "JOIN", "INTO", "UPDATE", "TABLE", "VIEW", "DESCRIBE", "DESC",
+})
 _PENDING_SHEETS: deque[Any] = deque()
 
 
@@ -79,7 +84,7 @@ class ClickHouseSession:
 
     def complete(self, request: SqlCompletionRequest) -> dict[str, Any]:
         snapshot = self.metadata.snapshot()
-        return complete_sql(snapshot, request, keywords=CLICKHOUSE_KEYWORDS, schema_detail="database")
+        return _complete_clickhouse_sql(snapshot, request)
 
     def enter_cell(self) -> None:
         self.metadata.ensure_fresh_async()
@@ -113,6 +118,31 @@ class ClickHouseSession:
         self.client = None
         if client is not None:
             _close_client(client)
+
+
+def _complete_clickhouse_sql(
+    snapshot: MetadataSnapshot,
+    request: SqlCompletionRequest,
+) -> dict[str, list[dict[str, Any]]]:
+    if _is_blank_relation_context(request.prefix):
+        snapshot = MetadataSnapshot(
+            schemas=list(snapshot.schemas),
+            refreshed_at=snapshot.refreshed_at,
+        )
+    return complete_sql(
+        snapshot,
+        request,
+        keywords=CLICKHOUSE_KEYWORDS,
+        schema_detail="database",
+        relation_keywords=CLICKHOUSE_RELATION_KEYWORDS,
+    )
+
+
+def _is_blank_relation_context(prefix: str) -> bool:
+    if not prefix or not prefix[-1].isspace():
+        return False
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", prefix)
+    return bool(words and words[-1].upper() in CLICKHOUSE_RELATION_KEYWORDS)
 
 
 class ClickHouseResultSheet(SequenceSheet):
@@ -273,6 +303,13 @@ def install_clickhouse_commands() -> None:
         next_sheet.ensureLoaded()
 
     setattr(visidata.BaseSheet, "_jusi_clickhouse_commands_v1", True)
+
+
+def _initialize_visidata_application() -> None:
+    from jusi.visidata_support import initialize_visidata
+
+    initialize_visidata(open_name="selection.sql", open_filetype="sql")
+    install_clickhouse_commands()
 
 
 def _queue_sheet(sheet: ClickHouseResultSheet) -> None:
@@ -547,10 +584,7 @@ def _handle_application_operation(
 def run_clickhouse_application(payload_path: Path, socket_path: str) -> int:
     session: ClickHouseSession | None = None
     try:
-        from jusi.plugins.vd.application import install_editor_actions
-
-        install_clickhouse_commands()
-        install_editor_actions()
+        _initialize_visidata_application()
         visidata.vd.timeouts_before_idle = -1
         payload = _read_payload(payload_path)
         query = str(payload.get("sql", "")).strip() or CLICKHOUSE_BOOTSTRAP_SQL

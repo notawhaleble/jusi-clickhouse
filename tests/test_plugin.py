@@ -23,7 +23,9 @@ from jusi_clickhouse.ipc import ApplicationController, WorkerApplicationBridge
 from jusi_clickhouse.metadata import load_clickhouse_metadata
 from jusi_clickhouse.runner import (
     ClickHouseResultSheet,
+    _complete_clickhouse_sql,
     _followup_sql,
+    _initialize_visidata_application,
     _iter_stream_rows,
     _looks_like_result_query,
     _refetch_cell_as_bytes,
@@ -114,6 +116,25 @@ def test_followup_preserves_literal_sql_but_removes_magic_header() -> None:
     assert _followup_sql("%%sql analytics\nselect α") == "select α"
 
 
+def test_application_loads_visidata_config_before_provider_commands(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+    monkeypatch.setattr(
+        "jusi.visidata_support.initialize_visidata",
+        lambda **kwargs: calls.append(("initialize", kwargs)),
+    )
+    monkeypatch.setattr(
+        "jusi_clickhouse.runner.install_clickhouse_commands",
+        lambda: calls.append(("commands", {})),
+    )
+
+    _initialize_visidata_application()
+
+    assert calls == [
+        ("initialize", {"open_name": "selection.sql", "open_filetype": "sql"}),
+        ("commands", {}),
+    ]
+
+
 def test_worker_returns_one_terminal_and_delegates_to_family_router(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("jusi_clickhouse.worker.find_spec", lambda _name: object())
     worker = create_worker(worker_context())
@@ -184,6 +205,40 @@ def test_clickhouse_completion_uses_family_absolute_ranges_and_preserves_suffix(
     item = next(item for item in result["items"] if item["text"] == "email")
     assert item["start"] == 7
     assert item["end"] == 10
+
+
+def test_blank_relation_completion_returns_only_schemas() -> None:
+    prefix = "select * from "
+    request = SqlCompletionRequest(prefix, prefix, len(prefix), 0, len(prefix))
+    snapshot = MetadataSnapshot(
+        schemas=["demo", "system"],
+        objects=[CompletionObject("events", "demo", "table")],
+        columns=[CompletionColumn("events", "email", "demo", "String")],
+        functions=[CompletionObject("lower", "", "function")],
+    )
+
+    result = _complete_clickhouse_sql(snapshot, request)
+
+    assert [(item["text"], item["kind"]) for item in result["items"]] == [
+        ("demo", "schema"),
+        ("system", "schema"),
+    ]
+    assert {(item["start"], item["end"]) for item in result["items"]} == {
+        (len(prefix), len(prefix)),
+    }
+
+
+def test_typed_relation_completion_keeps_matching_metadata() -> None:
+    prefix = "select * from eve"
+    request = SqlCompletionRequest(prefix, prefix, len(prefix), 0, len(prefix))
+    snapshot = MetadataSnapshot(
+        schemas=["demo"],
+        objects=[CompletionObject("events", "demo", "table")],
+    )
+
+    result = _complete_clickhouse_sql(snapshot, request)
+
+    assert "events" in {item["text"] for item in result["items"]}
 
 
 def test_metadata_collector_supplies_family_models() -> None:

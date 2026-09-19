@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jusi-clickhouse"
-version = "0.2.0"
+version = "0.2.1"
 description = "ClickHouse exact-provider plugin for Jusi 1.0 SQL"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,7 @@ authors = [
 ]
 dependencies = [
   "clickhouse-connect>=0.7",
-  "jusi>=1.0,<2",
+  "jusi>=1.0.2,<2",
   "jusi-sql>=0.2,<0.3",
   "visidata>=3,<4",
 ]

@@ -34,6 +34,10 @@ open result streams. `JusiInterrupt` requests cancellation of active queries.
 Closing the client closes its streams, connection, private control socket, and
 staged launch data.
 
+The terminal application loads normal VisiData user configuration and plugins
+before installing Jusi and ClickHouse commands. This includes `~/.visidatarc`
+and paths selected through `VD_CONFIG` and `VD_DIR`.
+
 For a local manual-test database:
 
 ```bash
