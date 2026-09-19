@@ -1,4 +1,4 @@
-[sql.local_clickhouse]
+[sql.targets.local_clickhouse]
 provider = "clickhouse"
 host = "127.0.0.1"
 port = 58123

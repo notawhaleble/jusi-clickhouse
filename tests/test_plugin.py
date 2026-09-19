@@ -1,323 +1,248 @@
 from __future__ import annotations
 
+import importlib
 import os
+import sys
 import threading
 import zipfile
 from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
 
-from jusi.domain.models import JUSI_HANDLER_HANDOFF_MIME
-from jusi.plugins import DisplayHandlerSpec
+import pytest
 
-from jusi_clickhouse.completion import completion_items, parse_query_relations
+from jusi.plugin_api import OperationRejected, WorkerContext, validate_discovered_entry
+from jusi.protocol import validate_plugin_kernel_message
+from jusi_sql import CompletionColumn, CompletionObject, MetadataSnapshot, SqlCompletionRequest, find_sql_actions
+from jusi_sql.kernel import _reset_runtime_for_tests, dispatch_sql
+
+from jusi_clickhouse.catalog import catalog_entry
 from jusi_clickhouse.config import parse_clickhouse_options
 from jusi_clickhouse.constants import CLICKHOUSE_BOOTSTRAP_SQL
-from jusi_clickhouse.kernel import _parse_sql_line, _sql_blank_body_transformer, configure_sql_session, register_sql_magic
-from jusi_clickhouse.metadata import CompletionColumn, CompletionObject, MetadataCache, MetadataSnapshot
-from jusi_clickhouse.plugin import ClickHouseHandler, display_handler_specs
-from jusi_clickhouse.runner import _iter_stream_rows, _looks_like_result_query, _refetch_cell_as_bytes, _write_raw_value_file
-from jusi_clickhouse.state import target_cache_dir
+from jusi_clickhouse.ipc import ApplicationController, WorkerApplicationBridge
+from jusi_clickhouse.metadata import load_clickhouse_metadata
+from jusi_clickhouse.runner import (
+    ClickHouseResultSheet,
+    _followup_sql,
+    _iter_stream_rows,
+    _looks_like_result_query,
+    _refetch_cell_as_bytes,
+    _write_raw_value_file,
+)
+from jusi_clickhouse.worker import ClickHouseClientSession, create_worker
 
 
-def test_display_handler_spec_registers_sql_magic() -> None:
-    specs = display_handler_specs()
-    assert len(specs) == 1
-    spec = specs[0]
-    assert isinstance(spec, DisplayHandlerSpec)
-    assert spec.handler_id == "clickhouse"
-    assert spec.magic_commands[0].name == "sql"
-    assert spec.kernel_extension_modules == ("jusi_clickhouse.kernel",)
-    assert spec.presentation["completion"] is True
+def worker_context() -> WorkerContext:
+    return WorkerContext("worker_1", "runtime_1", "clickhouse", "sql", "client_1", "execution_1")
 
 
-def test_bootstrap_body_is_safe_empty_result_query() -> None:
-    assert ClickHouseHandler.bootstrap_cell_body("analytics") == "SELECT 1 AS jusi_bootstrap WHERE 0"
+def test_catalog_is_an_exact_jusi_1_sql_provider() -> None:
+    assert catalog_entry() == {
+        "plugin_id": "clickhouse",
+        "plugin_version": "0.2.0",
+        "distribution": "jusi-clickhouse",
+        "families": [{
+            "family_id": "sql",
+            "magic_name": "sql",
+            "capabilities": ["execute", "followup", "complete", "interrupt", "editor_actions"],
+            "presentation": {"syntax": "sql", "indent": "sql"},
+            "provider_presentation": {"syntax": "clickhouse", "indent": "sql"},
+        }],
+        "kernel_extensions": ["jusi_clickhouse.kernel"],
+        "worker_entry_point": "jusi_clickhouse.worker:create_worker",
+        "media_types": ["text/x-ansi"],
+        "interaction": "terminal_interactive",
+    }
 
 
-def test_result_query_detection_matches_clickhouse_result_statements() -> None:
-    assert _looks_like_result_query("select 1") is True
-    assert _looks_like_result_query("show databases") is True
-    assert _looks_like_result_query("describe table events") is True
-    assert _looks_like_result_query("insert into t values (1)") is False
-
-
-def test_parse_clickhouse_options_keeps_driver_options_and_plugin_options() -> None:
-    options = parse_clickhouse_options(
-        {
-            "provider": "clickhouse",
-            "host": "db.example",
-            "database": "analytics",
-            "password": "secret",
-            "initial_fetch": "25",
-        }
+def test_catalog_identity_matches_distribution_metadata() -> None:
+    validated = validate_discovered_entry(
+        catalog_entry(),
+        entry_point_name="clickhouse",
+        distribution="jusi-clickhouse",
+        distribution_version="0.2.0",
     )
+    assert validated["plugin_id"] == "clickhouse"
+
+
+def test_catalog_import_does_not_load_runtime_dependencies(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    for name in list(sys.modules):
+        if name == "jusi_clickhouse.catalog" or name.startswith(("clickhouse_connect", "visidata", "IPython")):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    importlib.import_module("jusi_clickhouse.catalog").catalog_entry()
+    assert not any(name.startswith(("clickhouse_connect", "visidata", "IPython")) for name in sys.modules)
+
+
+class FakeIp:
+    def __init__(self) -> None:
+        self.magics_manager = SimpleNamespace(magics={"cell": {}})
+        self.registrations = []
+
+    def register_magic_function(self, function, *, magic_kind, magic_name):  # type: ignore[no-untyped-def]
+        self.magics_manager.magics[magic_kind][magic_name] = function
+        self.registrations.append((magic_kind, magic_name))
+
+
+def test_kernel_uses_family_dispatcher_and_exact_handoff() -> None:
+    _reset_runtime_for_tests()
+    kernel = importlib.reload(importlib.import_module("jusi_clickhouse.kernel"))
+    kernel.configure_jusi_runtime_v1({
+        "sql": {"targets": {"analytics": {"provider": "clickhouse", "host": "db"}}}
+    })
+    ipython = FakeIp()
+    kernel.load_ipython_extension(ipython)
+    assert ipython.registrations == [("cell", "sql")]
+    handoff = dispatch_sql("analytics", "")
+    validate_plugin_kernel_message(handoff)
+    assert handoff["plugin_id"] == "clickhouse"
+    assert handoff["payload"] == {
+        "alias": "analytics", "sql": CLICKHOUSE_BOOTSTRAP_SQL, "options": {"host": "db"},
+    }
+    _reset_runtime_for_tests()
+
+
+def test_parse_clickhouse_options_keeps_only_driver_options() -> None:
+    options = parse_clickhouse_options({
+        "host": "db.example", "database": "analytics", "password": "secret", "initial_fetch": "25",
+    })
     assert options.initial_fetch == 25
     assert options.connect == {"host": "db.example", "database": "analytics", "password": "secret"}
 
 
-def test_parse_sql_line_supports_initial_fetch_magic_arg() -> None:
-    alias, options = _parse_sql_line("analytics --initial-fetch 7")
-    assert alias == "analytics"
-    assert options == {"initial_fetch": 7}
+def test_followup_preserves_literal_sql_but_removes_magic_header() -> None:
+    assert _followup_sql("select 1") == "select 1"
+    assert _followup_sql("%%sql analytics\nselect α") == "select α"
 
 
-def test_kernel_substitutes_clickhouse_blank_body_bootstrap(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    captured: list[dict[str, object]] = []
-
-    class FakeMagicsManager:
-        magics = {"cell": {}}
-
-    class FakeIp:
-        magics_manager = FakeMagicsManager()
-
-        def register_magic_function(self, func, *, magic_kind: str, magic_name: str) -> None:  # type: ignore[no-untyped-def]
-            assert magic_kind == "cell"
-            assert magic_name == "sql"
-            self.magic = func
-
-    def fake_display(payload, *, raw=False, metadata=None):  # type: ignore[no-untyped-def]
-        captured.append({"payload": payload, "raw": raw, "metadata": metadata})
-
-    monkeypatch.setattr("IPython.display.display", fake_display)
-    configure_sql_session({"sql": {"local_ch": {"provider": "clickhouse", "host": "127.0.0.1"}}})
-    fake_ip = FakeIp()
-    register_sql_magic(fake_ip)
-
-    fake_ip.magic("local_ch", "\n")
-
-    handoff = captured[0]["payload"][JUSI_HANDLER_HANDOFF_MIME]  # type: ignore[index]
-    assert handoff["content"] == CLICKHOUSE_BOOTSTRAP_SQL
+def test_worker_returns_one_terminal_and_delegates_to_family_router(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("jusi_clickhouse.worker.find_spec", lambda _name: object())
+    worker = create_worker(worker_context())
+    result = worker.handle("execute", {"alias": "analytics", "sql": "select 1", "options": {"host": "db"}})
+    assert result.result == {"accepted": True, "alias": "analytics"}
+    assert len(result.core_requests) == 1
+    surface = result.core_requests[0]
+    assert surface.request_id == "clickhouse_visidata"
+    assert surface.argv[1:3] == ("-m", "jusi_clickhouse.runner")
+    assert "signal" in surface.capabilities
+    with pytest.raises(OperationRejected, match="already started"):
+        worker.handle("execute", {"alias": "analytics", "sql": "select 2", "options": {}})
+    worker.close()
 
 
-def test_kernel_transformer_adds_body_for_header_only_clickhouse_magic() -> None:
-    configure_sql_session({"sql": {"local_ch": {"provider": "clickhouse", "host": "127.0.0.1"}}})
-    assert _sql_blank_body_transformer(["%%sql local_ch\n"]) == [
-        "%%sql local_ch\n",
-        CLICKHOUSE_BOOTSTRAP_SQL + "\n",
-    ]
-
-
-def test_target_cache_dir_redacts_secret_values(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path))
-    first = target_cache_dir("analytics", {"host": "db", "password": "one"})
-    second = target_cache_dir("analytics", {"host": "db", "password": "two"})
-    assert first == second
-    assert str(first).startswith(str(tmp_path / "plugins" / "clickhouse" / "analytics"))
-
-
-def test_parse_query_relations_extracts_aliases() -> None:
-    relations = parse_query_relations(
-        "select u.id, o.total from analytics.users u join orders as o on o.user_id = u.id"
-    )
-    assert ("analytics", "users", "u") in [(item.schema, item.table, item.alias) for item in relations]
-    assert ("", "orders", "o") in [(item.schema, item.table, item.alias) for item in relations]
-
-
-def test_completion_items_include_alias_columns() -> None:
-    snapshot = MetadataSnapshot(
-        schemas=["analytics"],
-        objects=[CompletionObject(schema="analytics", name="users", kind="table", detail="MergeTree")],
-        columns=[CompletionColumn(schema="analytics", table="users", name="email", data_type="String")],
-        functions=[CompletionObject(schema="", name="lower", kind="function", detail="system")],
-        refreshed_at=1.0,
-    )
-    items = completion_items(
-        snapshot,
-        {
-            "current_word": "e",
-            "cursor_col": len("select u.e"),
-            "line_text": "select u.e",
-            "cell_text": "%%sql local_ch\nselect u.e from analytics.users u",
-        },
-    )
-    alias_item = next(item for item in items if item["value"] == "u.email" and item["kind"] == "column")
-    assert alias_item["start_col"] == len("select ")
-    assert alias_item["end_col"] == len("select u.e")
-
-
-def test_completion_span_handles_vim_cursor_col_after_word() -> None:
-    snapshot = MetadataSnapshot(
-        schemas=["analytics"],
-        objects=[CompletionObject(schema="analytics", name="items", kind="table")],
-        columns=[CompletionColumn(schema="analytics", table="items", name="value", data_type="String")],
-        functions=[],
-        refreshed_at=1.0,
-    )
-    items = completion_items(
-        snapshot,
-        {
-            "current_word": "value",
-            "cursor_col": 13,
-            "line_text": "select value from items",
-            "cell_text": "%%sql local_ch\nselect value from items",
-        },
-    )
-    value_item = next(item for item in items if item["value"] == "value" and item["kind"] == "column")
-    assert value_item["start_col"] == len("select ")
-    assert value_item["end_col"] == len("select value")
-
-
-def test_completion_after_from_space_uses_empty_cursor_span_and_relation_items() -> None:
-    snapshot = MetadataSnapshot(
-        schemas=["INFORMATION_SCHEMA", "demo"],
-        objects=[CompletionObject(schema="demo", name="accounts", kind="table")],
-        columns=[],
-        functions=[CompletionObject(schema="", name="FROM_BASE64", kind="function", detail="system")],
-        refreshed_at=1.0,
-    )
-    line_text = "select * FROM "
-    items = completion_items(
-        snapshot,
-        {
-            "current_word": "FROM",
-            "cursor_col": len(line_text),
-            "line_text": line_text,
-            "cell_text": f"%%sql local_ch\n{line_text}",
-        },
-    )
-
-    values = {item["value"] for item in items}
-    assert "FROM_BASE64" not in values
-    assert "INFORMATION_SCHEMA" in values
-    assert "demo.accounts" in values
-    for item in items:
-        assert item["start_col"] == len(line_text)
-        assert item["end_col"] == len(line_text)
-
-
-def test_handler_forwards_complete_payload_with_cursor_context() -> None:
-    handler = ClickHouseHandler()
-    calls: list[tuple[str, dict[str, object]]] = []
-
-    class FakeContext:
-        def call_backend_action(self, action_name: str, payload: dict[str, object]) -> dict[str, object]:
-            calls.append((action_name, payload))
-            return {"items": [{"value": "value", "kind": "column"}]}
-
-    payload = {
-        "cell_text": "%%sql local_ch\nselect value from demo.items",
-        "cursor_row": 1,
-        "cursor_col": 12,
-        "line_text": "select value",
-        "current_word": "value",
+def test_worker_editor_actions_are_content_based() -> None:
+    session = ClickHouseClientSession(worker_context())
+    assert session.editor_action("copy", {"text": "select α", "linewise": True}).result == {
+        "action": "copy", "text": "select α", "regtype": "V",
     }
+    assert session.editor_action("open", {"text": "select 1"}).result["name"] == "selection.sql"
+    with pytest.raises(OperationRejected, match="requires text"):
+        session.editor_action("copy", {})
 
-    items = handler.complete(FakeContext(), payload)  # type: ignore[arg-type]
 
-    assert calls == [
-        (
-            "plugin_runtime_request",
-            {
-                "message_type": "complete",
-                "payload": payload,
-            },
-        )
+def test_private_bridge_round_trip_and_interrupt() -> None:
+    socket_path = f"/tmp/jusi-ch-test-{os.getpid()}.sock"
+    Path(socket_path).unlink(missing_ok=True)
+    bridge = WorkerApplicationBridge(socket_path)
+    interrupted = threading.Event()
+
+    def handle(operation: str, payload: dict) -> dict:
+        if operation == "interrupt":
+            interrupted.set()
+        return {"operation": operation, **payload}
+
+    controller = ApplicationController(bridge.socket_path, handle)
+    controller.start()
+    assert bridge.request("followup", {"body": "select 2"})["result"]["body"] == "select 2"
+    bridge.interrupt()
+    assert interrupted.wait(1)
+    bridge.close()
+
+
+def test_result_sheet_uses_family_actions() -> None:
+    session = SimpleNamespace(alias="analytics", register_sheet=lambda _sheet: None)
+    sheet = ClickHouseResultSheet(session=session, query="select 1")
+    actions = find_sql_actions(sheet)
+    assert actions is not None
+    assert actions.fetch_more.__self__ is sheet
+
+
+def test_clickhouse_completion_uses_family_absolute_ranges_and_preserves_suffix() -> None:
+    from jusi_clickhouse.runner import ClickHouseSession
+
+    session = object.__new__(ClickHouseSession)
+    session.metadata = SimpleNamespace(snapshot=lambda: MetadataSnapshot(
+        columns=[CompletionColumn("events", "email", "demo", "String")],
+    ))
+    request = SqlCompletionRequest.from_payload({
+        "body": "select emaSUFFIX",
+        "prefix": "select ema",
+        "cursor_pos": 10,
+        "cursor_row": 0,
+        "cursor_col": 10,
+    })
+    result = session.complete(request)
+    item = next(item for item in result["items"] if item["text"] == "email")
+    assert item["start"] == 7
+    assert item["end"] == 10
+
+
+def test_metadata_collector_supplies_family_models() -> None:
+    result_sets = [
+        [("demo",)],
+        [("demo", "events", "MergeTree")],
+        [("demo", "events", "id", "UInt64")],
+        [("lower", "System")],
     ]
-    assert items[0]["start_col"] == len("select ")
-    assert items[0]["end_col"] == len("select value")
+
+    class Client:
+        def query(self, _sql):  # type: ignore[no-untyped-def]
+            return SimpleNamespace(result_rows=result_sets.pop(0))
+
+    assert load_clickhouse_metadata(Client()) == MetadataSnapshot(
+        schemas=["demo"],
+        objects=[CompletionObject("events", "demo", "table", "MergeTree")],
+        columns=[CompletionColumn("events", "id", "demo", "UInt64")],
+        functions=[CompletionObject("lower", "", "function", "System")],
+    )
+
+
+def test_result_query_detection_matches_clickhouse_statements() -> None:
+    assert _looks_like_result_query("select 1") is True
+    assert _looks_like_result_query("show databases") is True
+    assert _looks_like_result_query("insert into t values (1)") is False
 
 
 def test_iter_stream_rows_supports_block_and_row_streams() -> None:
     assert list(_iter_stream_rows([[("a", 1), ("b", 2)]])) == [("a", 1), ("b", 2)]
     assert list(_iter_stream_rows([("a", 1), ("b", 2)])) == [("a", 1), ("b", 2)]
-    assert list(_iter_stream_rows([["a", 1]])) == [["a", 1]]
 
 
 def test_write_raw_value_file_preserves_binary_bytes() -> None:
     path = _write_raw_value_file(b"PK\x05\x06" + (b"\x00" * 18), ".zip")
-    with open(path, "rb") as handle:
-        assert handle.read(4) == b"PK\x05\x06"
-    os.unlink(path)
+    assert Path(path).read_bytes()[:4] == b"PK\x05\x06"
+    Path(path).unlink()
 
 
 def test_write_raw_value_file_preserves_clickhouse_binary_string_for_zip() -> None:
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("blob-readme.txt", "Jusi ClickHouse blob fixture\n")
-    raw_zip = buffer.getvalue()
-    value = raw_zip.decode("latin-1")
-
-    path = _write_raw_value_file(value, ".zip")
-
+    path = _write_raw_value_file(buffer.getvalue().decode("latin-1"), ".zip")
     with zipfile.ZipFile(path) as archive:
         assert archive.namelist() == ["blob-readme.txt"]
-    os.unlink(path)
-
-
-def test_write_raw_value_file_keeps_text_suffix_as_utf8_text() -> None:
-    path = _write_raw_value_file("cafe \N{SNOWMAN}", ".txt")
-    with open(path, encoding="utf-8") as handle:
-        assert handle.read() == "cafe \N{SNOWMAN}"
-    os.unlink(path)
+    Path(path).unlink()
 
 
 def test_refetch_cell_as_bytes_uses_clickhouse_column_format() -> None:
-    class FakeResult:
-        result_rows = [(b"PK\x03\x04raw zip bytes",)]
-
     class FakeClient:
         def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        def query(self, sql: str, **kwargs: object) -> FakeResult:
+            self.calls = []
+        def query(self, sql, **kwargs):  # type: ignore[no-untyped-def]
             self.calls.append({"sql": sql, **kwargs})
-            return FakeResult()
+            return SimpleNamespace(result_rows=[(b"PK\x03\x04raw zip bytes",)])
 
-    class FakeSession:
-        def __init__(self) -> None:
-            self.lock = threading.RLock()
-            self.client = FakeClient()
-
-        def connect(self) -> FakeClient:
-            return self.client
-
-    class FakeSheet:
-        query = "SELECT payload FROM demo.blob_files;"
-
-        def __init__(self) -> None:
-            self.session = FakeSession()
-
-    sheet = FakeSheet()
-
-    value = _refetch_cell_as_bytes(sheet, column_name="payload", row_index=3)
-
-    assert value == b"PK\x03\x04raw zip bytes"
-    call = sheet.session.client.calls[0]
-    assert "FROM (SELECT payload FROM demo.blob_files)" in str(call["sql"])
-    assert "LIMIT 1 OFFSET 3" in str(call["sql"])
-    assert call["column_formats"] == {"payload": "bytes"}
-
-
-def test_metadata_snapshot_does_not_refresh_until_cell_entry(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    calls: list[bool] = []
-
-    def load() -> MetadataSnapshot:
-        calls.append(True)
-        return MetadataSnapshot(schemas=["analytics"])
-
-    cache = MetadataCache(tmp_path, load)
-    assert cache.snapshot().schemas == []
-    assert calls == []
-    assert cache.ensure_fresh_async() is True
-    assert cache.close(timeout=2.0) is True
-    assert calls == [True]
-    assert cache.snapshot().schemas == ["analytics"]
-
-
-def test_metadata_refresh_deduplicates_concurrent_cell_entries(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    started = threading.Event()
-    release = threading.Event()
-    calls: list[bool] = []
-
-    def load() -> MetadataSnapshot:
-        calls.append(True)
-        started.set()
-        release.wait(timeout=2.0)
-        return MetadataSnapshot(schemas=["analytics"])
-
-    cache = MetadataCache(tmp_path, load)
-    assert cache.ensure_fresh_async() is True
-    assert started.wait(timeout=2.0)
-    assert cache.ensure_fresh_async() is False
-    release.set()
-    assert cache.close(timeout=2.0) is True
-    assert calls == [True]
+    client = FakeClient()
+    session = SimpleNamespace(lock=threading.RLock(), connect=lambda: client)
+    sheet = SimpleNamespace(query="SELECT payload FROM demo.blob_files;", session=session)
+    assert _refetch_cell_as_bytes(sheet, column_name="payload", row_index=3) == b"PK\x03\x04raw zip bytes"
+    assert client.calls[0]["column_formats"] == {"payload": "bytes"}

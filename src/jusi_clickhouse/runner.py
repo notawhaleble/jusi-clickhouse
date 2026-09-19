@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
+import curses
+from collections import deque
+from pathlib import Path
 import sys
 import tempfile
 import threading
@@ -10,29 +11,32 @@ import uuid
 from typing import Any, Iterable, Iterator
 
 import visidata
-from visidata import ItemColumn, run, vd
+from visidata import ItemColumn, SequenceSheet, run, vd
 
-from jusi.infrastructure.debug_timing import emit_timing
-from jusi.visidata_support import bind_visidata_runtime, set_plugin_execution_status
-from jusi_sql import BaseSqlSheet, SqlSheetRuntime, install_sql_base_sheet_api, queue_sql_sheet, resolve_sql_target
+from jusi_sql import (
+    MetadataCache,
+    SqlCompletionRequest,
+    SqlSheetActions,
+    bind_sql_actions,
+    complete_sql,
+    install_visidata_commands,
+    sql_cache_directory,
+)
 
-from .completion import completion_items
 from .config import parse_clickhouse_options
 from .constants import CLICKHOUSE_BOOTSTRAP_SQL
-from .metadata import MetadataCache, load_clickhouse_metadata
-from .state import target_cache_dir
+from .ipc import ApplicationController
+from .metadata import load_clickhouse_metadata
 
 
 RESULT_QUERY_PREFIXES = ("select", "with", "show", "describe", "desc", "explain")
-
-
-class ClickHouseSheetRuntime(SqlSheetRuntime):
-    def handle_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {"items": list(self.complete(dict(payload)) or ())}
-
-    def handle_followup(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self.followup(dict(payload))
-        return {}
+CLICKHOUSE_KEYWORDS = (
+    "SELECT", "FROM", "PREWHERE", "WHERE", "JOIN", "LEFT", "RIGHT", "FULL",
+    "INNER", "OUTER", "ON", "GROUP", "BY", "ORDER", "HAVING", "LIMIT",
+    "OFFSET", "INSERT", "INTO", "CREATE", "ALTER", "DROP", "TRUNCATE", "WITH",
+    "FORMAT", "SETTINGS", "VALUES", "SHOW", "DESCRIBE", "EXPLAIN",
+)
+_PENDING_SHEETS: deque[Any] = deque()
 
 
 class ClickHouseSession:
@@ -50,15 +54,15 @@ class ClickHouseSession:
         self.lock = threading.RLock()
         self.sheets: list[ClickHouseResultSheet] = []
         self.metadata = MetadataCache(
-            target_cache_dir(alias, self.connect_options),
+            sql_cache_directory("clickhouse", alias, self.connect_options),
             lambda: self.with_client(lambda client: load_clickhouse_metadata(client), blocking=False),
+            on_warning=lambda message: vd.warning(message),
         )
 
     def connect(self) -> Any:
         with self.lock:
             if self.client is None:
                 self.client = _connect_clickhouse(self.connect_options)
-                emit_timing("sql.clickhouse.connection.opened", alias=self.alias)
             return self.client
 
     def with_client(self, fn, *, blocking: bool = True):  # type: ignore[no-untyped-def]
@@ -73,25 +77,19 @@ class ClickHouseSession:
     def register_sheet(self, sheet: "ClickHouseResultSheet") -> None:
         self.sheets.append(sheet)
 
-    def complete(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def complete(self, request: SqlCompletionRequest) -> dict[str, Any]:
         snapshot = self.metadata.snapshot()
-        items = completion_items(snapshot, payload)
-        emit_timing("sql.clickhouse.complete", alias=self.alias, item_count=len(items), current_word=str(payload.get("current_word", "")))
-        return items
+        return complete_sql(snapshot, request, keywords=CLICKHOUSE_KEYWORDS, schema_detail="database")
 
     def enter_cell(self) -> None:
-        started = self.metadata.ensure_fresh_async()
-        emit_timing("sql.clickhouse.metadata.enter_cell", alias=self.alias, refresh_started=started)
+        self.metadata.ensure_fresh_async()
 
-    def followup(self, payload: dict[str, Any]) -> None:
-        cell_text = str(payload.get("cell_text", "")).strip()
-        if not cell_text:
+    def followup(self, body: str) -> None:
+        sql = _followup_sql(body).strip()
+        if not sql:
             return
         self.enter_cell()
-        sheet = ClickHouseResultSheet(session=self, query=cell_text)
-        bind_clickhouse_runtime(sheet)
-        queue_sql_sheet(sheet)
-        emit_timing("sql.clickhouse.followup", alias=self.alias, query_len=len(cell_text), sheet=sheet.name)
+        _queue_sheet(ClickHouseResultSheet(session=self, query=sql))
 
     def interrupt(self) -> None:
         query_ids = [sheet.query_id for sheet in self.sheets if sheet.active]
@@ -103,14 +101,7 @@ class ClickHouseSession:
             except Exception as exc:
                 vd.warning(f"ClickHouse cancellation failed: {exc}")
         if query_ids:
-            set_plugin_execution_status("interrupted")
             vd.warning("ClickHouse query cancellation requested")
-
-    def commit(self) -> None:
-        vd.warning("ClickHouse transactions are not supported by this plugin")
-
-    def rollback(self) -> None:
-        vd.warning("ClickHouse transactions are not supported by this plugin")
 
     def close(self) -> None:
         metadata_done = self.metadata.close(timeout=2.0)
@@ -122,10 +113,9 @@ class ClickHouseSession:
         self.client = None
         if client is not None:
             _close_client(client)
-            emit_timing("sql.clickhouse.connection.closed", alias=self.alias)
 
 
-class ClickHouseResultSheet(BaseSqlSheet):
+class ClickHouseResultSheet(SequenceSheet):
     rowtype = "rows"
 
     def __init__(self, *, session: ClickHouseSession, query: str) -> None:
@@ -140,10 +130,9 @@ class ClickHouseResultSheet(BaseSqlSheet):
         self._row_iter: Iterator[Any] | None = None
         self._buffer: list[Any] = []
         session.register_sheet(self)
+        bind_sql_actions(self, SqlSheetActions(fetch_more=self.fetch_more))
 
     def iterload(self):  # type: ignore[no-untyped-def]
-        set_plugin_execution_status("busy")
-        emit_timing("sql.clickhouse.iterload.begin", alias=self.session.alias, query_len=len(self.query))
         try:
             if _looks_like_result_query(self.query):
                 yield from self._load_result_query()
@@ -152,10 +141,8 @@ class ClickHouseResultSheet(BaseSqlSheet):
         except Exception as exc:
             self.columns = [ItemColumn("error", 0)]
             yield [f"{exc.__class__.__name__}: {exc}"]
-            emit_timing("sql.clickhouse.iterload.error", alias=self.session.alias, error_type=type(exc).__name__, error=str(exc))
         finally:
             self.active = False
-            set_plugin_execution_status("follow-up")
 
     def fetch_more(self, count: int) -> int:
         if self.stream_closed_reason:
@@ -164,7 +151,6 @@ class ClickHouseResultSheet(BaseSqlSheet):
         if self.exhausted or self._row_iter is None:
             vd.status("ClickHouse stream is exhausted")
             return 0
-        set_plugin_execution_status("busy")
         try:
             with self.session.lock:
                 rows = self._fetch_rows(count)
@@ -175,8 +161,6 @@ class ClickHouseResultSheet(BaseSqlSheet):
         except Exception as exc:
             vd.warning(f"ClickHouse fetch failed: {exc}")
             return 0
-        finally:
-            set_plugin_execution_status("follow-up")
 
     def close_stream(self, reason: str = "") -> None:
         if reason:
@@ -210,7 +194,6 @@ class ClickHouseResultSheet(BaseSqlSheet):
                 self.columns = [ItemColumn(name, index) for index, name in enumerate(column_names)]
                 self._row_iter = iter(_iter_stream_rows(source))
             rows = self._fetch_rows(self.session.initial_fetch)
-        emit_timing("sql.clickhouse.iterload.rows", alias=self.session.alias, row_count=len(rows), column_count=len(self.columns))
         if self.columns:
             yield [column.name for column in self.columns]
         for row in rows:
@@ -262,59 +245,10 @@ class ClickHouseResultSheet(BaseSqlSheet):
             vd.status("ClickHouse stream exhausted")
 
 
-def bind_clickhouse_runtime(sheet: ClickHouseResultSheet) -> None:
-    runtime = ClickHouseSheetRuntime(
-        alias=sheet.session.alias,
-        provider="clickhouse",
-        complete=lambda control_payload: sheet.session.complete(control_payload),
-        followup=lambda control_payload: sheet.session.followup(control_payload),
-        interrupt=sheet.session.interrupt,
-        stop=sheet.session.close,
-    )
-    sheet.bind_sql_runtime(runtime)
-    bind_visidata_runtime(sheet, runtime)
-
-
 def install_clickhouse_commands() -> None:
-    install_sql_base_sheet_api()
-
-    for number in range(1, 10):
-        command_name = f"jusi-clickhouse-fetch-{number}"
-
-        def _fetch(sheet: Any, n: int = number) -> None:
-            ch_sheet = _clickhouse_sheet(sheet)
-            if ch_sheet is not None:
-                ch_sheet.fetch_more(n)
-
-        visidata.BaseSheet.command(str(number), command_name, f"fetch {number} ClickHouse rows", replay=False)(_fetch)
-
-    @visidata.BaseSheet.command("gf", "jusi-clickhouse-fetch-prompt", "fetch ClickHouse rows", replay=False)
-    def _fetch_prompt(sheet: Any) -> None:
-        ch_sheet = _clickhouse_sheet(sheet)
-        if ch_sheet is None:
-            return
-        raw = vd.input("fetch rows (0 for all): ")
-        try:
-            count = int(str(raw).strip())
-        except ValueError:
-            vd.warning("Fetch count must be a number")
-            return
-        if count < 0:
-            vd.warning("Fetch count must be >= 0")
-            return
-        ch_sheet.fetch_more(count)
-
-    @visidata.BaseSheet.command("gc", "jusi-clickhouse-commit", "commit ClickHouse transaction", replay=False)
-    def _commit(sheet: Any) -> None:
-        ch_sheet = _clickhouse_sheet(sheet)
-        if ch_sheet is not None:
-            ch_sheet.session.commit()
-
-    @visidata.BaseSheet.command("gr", "jusi-clickhouse-rollback", "roll back ClickHouse transaction", replay=False)
-    def _rollback(sheet: Any) -> None:
-        ch_sheet = _clickhouse_sheet(sheet)
-        if ch_sheet is not None:
-            ch_sheet.session.rollback()
+    install_visidata_commands(visidata)
+    if getattr(visidata.BaseSheet, "_jusi_clickhouse_commands_v1", False):
+        return
 
     @visidata.BaseSheet.command("gb", "jusi-clickhouse-open-raw-value", "open raw ClickHouse cell value", replay=False)
     def _open_raw_value(sheet: Any) -> None:
@@ -330,20 +264,32 @@ def install_clickhouse_commands() -> None:
         opened = vd.openPath(visidata.Path(path))
         vd.push(opened)
 
+    @visidata.BaseSheet.command("", "jusi-clickhouse-open-pending-sheet", "open pending ClickHouse result", replay=False)
+    def _open_pending(_sheet: Any) -> None:
+        if not _PENDING_SHEETS:
+            return
+        next_sheet = _PENDING_SHEETS.popleft()
+        vd.push(next_sheet)
+        next_sheet.ensureLoaded()
 
-def _clickhouse_sheet(sheet: Any) -> ClickHouseResultSheet | None:
-    current = sheet
-    seen: set[int] = set()
-    while current is not None:
-        marker = id(current)
-        if marker in seen:
-            break
-        seen.add(marker)
-        if isinstance(current, ClickHouseResultSheet):
-            return current
-        current = getattr(current, "source", None)
-    vd.warning("No active ClickHouse result sheet")
-    return None
+    setattr(visidata.BaseSheet, "_jusi_clickhouse_commands_v1", True)
+
+
+def _queue_sheet(sheet: ClickHouseResultSheet) -> None:
+    _PENDING_SHEETS.append(sheet)
+    vd.queueCommand("jusi-clickhouse-open-pending-sheet")
+    try:
+        curses.ungetch(curses.KEY_RESIZE)
+    except Exception:
+        pass
+
+
+def _followup_sql(body: str) -> str:
+    first, separator, remainder = body.partition("\n")
+    header = first.strip()
+    if header == "%%sql" or header.startswith(("%%sql ", "%%sql\t")):
+        return remainder if separator else ""
+    return body
 
 
 def _write_raw_value_file(value: Any, suffix: str) -> str:
@@ -569,78 +515,76 @@ def _escape_sql_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _load_payload() -> dict[str, Any]:
-    raw = os.environ.get("JUSI_SQL_PAYLOAD_JSON", "").strip()
-    if not raw:
-        raise RuntimeError("missing JUSI_SQL_PAYLOAD_JSON")
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise RuntimeError("invalid JUSI_SQL_PAYLOAD_JSON")
-    return payload
+def _read_payload(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    finally:
+        path.unlink(missing_ok=True)
+    if not isinstance(value, dict):
+        raise RuntimeError("invalid ClickHouse application payload")
+    return value
 
 
-def _clickhouse_target_options(alias: str, meta: dict[str, Any]) -> dict[str, object]:
-    target_config = meta.get("target_config")
-    if isinstance(target_config, dict):
-        provider = str(target_config.get("provider", "")).strip()
-        if provider and provider != "clickhouse":
-            raise RuntimeError(f"SQL target {alias!r} resolved to provider {provider!r}, not clickhouse")
-        return {str(key): value for key, value in target_config.items()}
-
-    session_config = meta.get("session_config")
-    if isinstance(session_config, dict):
-        target = resolve_sql_target(alias, config=session_config)
-        if target.provider != "clickhouse":
-            raise RuntimeError(f"SQL target {alias!r} resolved to provider {target.provider!r}, not clickhouse")
-        return dict(target.options)
-
-    raise RuntimeError("missing SQL target config")
-
-
-def _install_signal_handlers(session: ClickHouseSession) -> None:
-    previous = signal.getsignal(signal.SIGINT)
-
-    def _handle_sigint(signum: int, frame: Any) -> None:
-        _ = (signum, frame)
+def _handle_application_operation(
+    session: ClickHouseSession,
+    operation: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if operation == "followup":
+        body = payload.get("body")
+        if not isinstance(body, str):
+            raise ValueError("SQL followup requires string body")
+        session.followup(body)
+        return {"accepted": True}
+    if operation == "complete":
+        return session.complete(SqlCompletionRequest.from_payload(payload))
+    if operation == "interrupt":
         session.interrupt()
-        if callable(previous):
-            previous(signum, frame)
-
-    signal.signal(signal.SIGINT, _handle_sigint)
+        return {"accepted": True}
+    raise ValueError(f"unsupported ClickHouse application operation: {operation}")
 
 
-def run_clickhouse_runner() -> int:
+def run_clickhouse_application(payload_path: Path, socket_path: str) -> int:
     session: ClickHouseSession | None = None
     try:
+        from jusi.plugins.vd.application import install_editor_actions
+
         install_clickhouse_commands()
+        install_editor_actions()
         visidata.vd.timeouts_before_idle = -1
-        payload = _load_payload()
-        query = str(payload.get("content", "")).strip()
-        meta = payload.get("meta", {})
-        if not isinstance(meta, dict):
-            raise RuntimeError("invalid SQL payload meta")
-        alias = str(meta.get("alias", "")).strip()
+        payload = _read_payload(payload_path)
+        query = str(payload.get("sql", "")).strip() or CLICKHOUSE_BOOTSTRAP_SQL
+        alias = str(payload.get("alias", "")).strip()
         if not alias:
             raise RuntimeError("missing SQL target alias")
-        if not query:
-            query = CLICKHOUSE_BOOTSTRAP_SQL
-        options = parse_clickhouse_options(_clickhouse_target_options(alias, meta))
+        raw_options = payload.get("options")
+        if not isinstance(raw_options, dict):
+            raise RuntimeError("missing ClickHouse target options")
+        options = parse_clickhouse_options(raw_options)
         session = ClickHouseSession(
             alias=alias,
             connect_options=options.connect,
             initial_fetch=options.initial_fetch,
         )
-        _install_signal_handlers(session)
+        controller = ApplicationController(
+            socket_path,
+            lambda operation, control_payload: _handle_application_operation(session, operation, control_payload),
+        )
+        controller.start()
         session.enter_cell()
         sheet = ClickHouseResultSheet(session=session, query=query)
-        bind_clickhouse_runtime(sheet)
         run(sheet)
         return 0
     except Exception as exc:
-        emit_timing("sql.clickhouse.runner.error", error=str(exc), error_type=exc.__class__.__name__)
         sys.stderr.write(str(exc) + "\n")
         sys.stderr.flush()
         return 2
     finally:
         if session is not None:
             session.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4 or sys.argv[1] != "--application":
+        raise SystemExit("ClickHouse application requires a private payload path and control socket")
+    raise SystemExit(run_clickhouse_application(Path(sys.argv[2]), sys.argv[3]))

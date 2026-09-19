@@ -48,7 +48,7 @@ ClickHouse is running.
 
 jusi.toml:
 
-[sql.local_clickhouse]
+[sql.targets.local_clickhouse]
 provider = "clickhouse"
 host = "127.0.0.1"
 port = ${HTTP_PORT}
@@ -62,7 +62,7 @@ Manual test queries:
 %%sql local_clickhouse
 SELECT * FROM demo.account_summary ORDER BY id
 
-%%sql local_clickhouse --initial-fetch 5
+%%sql local_clickhouse
 SELECT number FROM system.numbers LIMIT 50
 
 %%sql local_clickhouse
