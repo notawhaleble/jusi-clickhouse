@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jusi-clickhouse"
-version = "0.2.1"
+dynamic = ["version"]
 description = "ClickHouse exact-provider plugin for Jusi 1.0 SQL"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,6 +24,9 @@ test = ["pytest>=8,<9"]
 
 [project.entry-points."jusi.plugins.v1"]
 clickhouse = "jusi_clickhouse.catalog:catalog_entry"
+
+[tool.hatch.version]
+path = "src/jusi_clickhouse/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jusi_clickhouse"]

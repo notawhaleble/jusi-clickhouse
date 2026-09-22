@@ -41,7 +41,7 @@ def worker_context() -> WorkerContext:
 def test_catalog_is_an_exact_jusi_1_sql_provider() -> None:
     assert catalog_entry() == {
         "plugin_id": "clickhouse",
-        "plugin_version": "0.2.0",
+        "plugin_version": "0.2.2",
         "distribution": "jusi-clickhouse",
         "families": [{
             "family_id": "sql",
@@ -62,7 +62,7 @@ def test_catalog_identity_matches_distribution_metadata() -> None:
         catalog_entry(),
         entry_point_name="clickhouse",
         distribution="jusi-clickhouse",
-        distribution_version="0.2.0",
+        distribution_version="0.2.2",
     )
     assert validated["plugin_id"] == "clickhouse"
 
