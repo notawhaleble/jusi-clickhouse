@@ -41,12 +41,12 @@ def worker_context() -> WorkerContext:
 def test_catalog_is_an_exact_jusi_1_sql_provider() -> None:
     assert catalog_entry() == {
         "plugin_id": "clickhouse",
-        "plugin_version": "0.2.2",
+        "plugin_version": "0.2.3",
         "distribution": "jusi-clickhouse",
         "families": [{
             "family_id": "sql",
             "magic_name": "sql",
-            "capabilities": ["execute", "followup", "complete", "interrupt", "editor_actions"],
+            "capabilities": ["execute", "bootstrap", "followup", "complete", "interrupt", "editor_actions"],
             "presentation": {"syntax": "sql", "indent": "sql"},
             "provider_presentation": {"syntax": "clickhouse", "indent": "sql"},
         }],
@@ -62,7 +62,7 @@ def test_catalog_identity_matches_distribution_metadata() -> None:
         catalog_entry(),
         entry_point_name="clickhouse",
         distribution="jusi-clickhouse",
-        distribution_version="0.2.2",
+        distribution_version="0.2.3",
     )
     assert validated["plugin_id"] == "clickhouse"
 
@@ -301,3 +301,58 @@ def test_refetch_cell_as_bytes_uses_clickhouse_column_format() -> None:
     sheet = SimpleNamespace(query="SELECT payload FROM demo.blob_files;", session=session)
     assert _refetch_cell_as_bytes(sheet, column_name="payload", row_index=3) == b"PK\x03\x04raw zip bytes"
     assert client.calls[0]["column_formats"] == {"payload": "bytes"}
+
+
+def test_bootstrap_reaches_ready_surface_and_metadata_without_query(monkeypatch):
+    import jusi_clickhouse.runner as runner
+
+    monkeypatch.setattr("jusi_clickhouse.worker.find_spec", lambda _name: object())
+    worker = create_worker(worker_context())
+    calls = []
+    control = {}
+
+    class ReadySession:
+        def __init__(self, **options):
+            self.alias = options["alias"]
+        def enter_cell(self):
+            calls.append("metadata")
+        def complete(self, request):
+            assert "metadata" in calls
+            return {"items": [{"text": "public", "start": request.cursor_pos, "end": request.cursor_pos}]}
+        def followup(self, body):
+            calls.append(("query", body))
+        def close(self):
+            calls.append("closed")
+
+    class Controller:
+        def __init__(self, path, handler):
+            control["handler"] = handler
+        def start(self):
+            calls.append("control")
+
+    def unexpected_query(**kwargs):
+        raise AssertionError("bootstrap constructed a query result")
+
+    def run_ready(sheet):
+        assert sheet.name == "analytics_ready"
+        assert calls == ["control", "metadata"]
+        complete = control["handler"]("complete", {"body": "", "prefix": "", "cursor_pos": 0,
+                                                   "cursor_row": 0, "cursor_col": 0})
+        assert complete["items"][0]["text"] == "public"
+        control["handler"]("followup", {"body": "select 42"})
+
+    monkeypatch.setattr(runner, "_initialize_visidata_application", lambda: None)
+    monkeypatch.setattr(runner, "ClickHouseSession", ReadySession)
+    monkeypatch.setattr(runner, "ApplicationController", Controller)
+    monkeypatch.setattr(runner, "ClickHouseResultSheet", unexpected_query)
+    monkeypatch.setattr(runner, "run", run_ready)
+    try:
+        result = worker.handle("execute", {"alias": "analytics", "sql": "", "options": {"host": "db"}, "bootstrap": True})
+        assert len(result.core_requests) == 1
+        path = worker._session.payload.path
+        payload = __import__("json").loads(path.read_text())
+        assert payload["bootstrap"] is True and payload["sql"] == ""
+        assert runner.run_clickhouse_application(path, "/tmp/unused-bootstrap-test.sock") == 0
+        assert calls == ["control", "metadata", ("query", "select 42"), "closed"]
+    finally:
+        worker.close()

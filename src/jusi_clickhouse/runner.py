@@ -25,6 +25,8 @@ from jusi_sql import (
     sql_cache_directory,
 )
 
+from jusi_sql.visidata import sql_bootstrap_sheet
+
 from .config import parse_clickhouse_options
 from .constants import CLICKHOUSE_BOOTSTRAP_SQL
 from .ipc import ApplicationController
@@ -587,7 +589,8 @@ def run_clickhouse_application(payload_path: Path, socket_path: str) -> int:
         _initialize_visidata_application()
         visidata.vd.timeouts_before_idle = -1
         payload = _read_payload(payload_path)
-        query = str(payload.get("sql", "")).strip() or CLICKHOUSE_BOOTSTRAP_SQL
+        bootstrap = payload.get("bootstrap", False)
+        query = "" if bootstrap else (str(payload.get("sql", "")).strip() or CLICKHOUSE_BOOTSTRAP_SQL)
         alias = str(payload.get("alias", "")).strip()
         if not alias:
             raise RuntimeError("missing SQL target alias")
@@ -606,7 +609,7 @@ def run_clickhouse_application(payload_path: Path, socket_path: str) -> int:
         )
         controller.start()
         session.enter_cell()
-        sheet = ClickHouseResultSheet(session=session, query=query)
+        sheet = sql_bootstrap_sheet(alias) if bootstrap else ClickHouseResultSheet(session=session, query=query)
         run(sheet)
         return 0
     except Exception as exc:

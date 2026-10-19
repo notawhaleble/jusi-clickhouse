@@ -14,8 +14,8 @@ authors = [
 ]
 dependencies = [
   "clickhouse-connect>=0.7",
-  "jusi>=1.0.2,<2",
-  "jusi-sql>=0.2,<0.3",
+  "jusi>=1.0.6,<2",
+  "jusi-sql>=0.2.1,<0.3",
   "visidata>=3,<4",
 ]
 

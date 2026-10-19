@@ -45,3 +45,15 @@ For a local manual-test database:
 ```
 
 The script builds `jusi-clickhouse-dev`, starts a local ClickHouse container, loads demo tables under `demo`, waits until it is ready, and prints a matching `jusi.toml` block.
+
+## Initialize without running a query
+
+Execute a cell containing only `%%sql analytics`, or run `:JusiBootstrap` while
+keeping a query draft in the cell. This opens a ready client and starts its
+normal metadata warm-up without running the draft or a dummy SQL query.
+Completion can use cached metadata immediately and fresh metadata as it arrives.
+Subsequent queries use the same client. Repeated `:JusiBootstrap` reuses it;
+changing the target alias requires closing the old client first.
+
+This requires the bootstrap-capable core and matching `jusi-sql` and SQL provider
+updates. No query history entry is added for initialization.
